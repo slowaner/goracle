@@ -113,14 +113,9 @@ For examples, see Anthony Tuininga's
 
 ### sql.NullString
 
-`sql.NullString` is not supported: Oracle DB does not differentiate between
-an empty string ("") and a NULL, so an
+Oracle interprets empty string `''` as NULL so don't be surprised when you insert empty string but receive back `nil`. 
 
-    sql.NullString{String:"", Valid:true} == sql.NullString{String:"", Valid:false}
-
-and this would be more confusing than not supporting `sql.NullString` at all.
-
-Just use plain old `string` !
+Query condition `field = ''` equals `field = null` which always returns `FALSE`.
 
 ### NUMBER
 
