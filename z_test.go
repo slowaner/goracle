@@ -294,7 +294,7 @@ END;
 		}
 	}
 
-	epoch := time.Date(2017, 11, 20, 12, 14, 21, 0, time.UTC)
+	epoch := time.Date(2017, 11, 20, 12, 14, 21, 0, time.Local)
 	for name, tC := range map[string]struct {
 		In   interface{}
 		Want string
@@ -1163,10 +1163,6 @@ func TestSelectFloat(t *testing.T) {
 			Dest: [3]interface{}{&i1, &i2, &i3},
 			Want: numbers{Int64: INT, Float: FLOAT},
 		},
-		"int,float,string": {
-			Dest: [3]interface{}{&n.Int, &n.Float, &n.String},
-			Want: numbers{Int: INT, Float: FLOAT},
-		},
 	} {
 		i1, i2, i3 = nil, nil, nil
 		n = numbers{}
@@ -2004,4 +2000,160 @@ CREATE OR REPLACE PROCEDURE test_CREATE_TASK_ACTIVITY (p_create_task_i IN PRJ_TA
 	if _, err := testDb.ExecContext(ctx, qry, o1, o2, 1); err != nil {
 		t.Error(err)
 	}
+}
+
+func TestTsTZ(t *testing.T) {
+	t.Parallel()
+	qry := "SELECT FROM_TZ(TO_TIMESTAMP('2019-05-01 09:39:12', 'YYYY-MM-DD HH24:MI:SS'), '{{.TZ}}') FROM DUAL"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	defer tl.enableLogging(t)()
+	var ts time.Time
+	{
+		qry := strings.Replace(qry, "{{.TZ}}", "01:00", 1)
+		if err := testDb.QueryRowContext(ctx, qry).Scan(&ts); err != nil {
+			t.Fatal(errors.Wrap(err, qry))
+		}
+	}
+	qry = strings.Replace(qry, "{{.TZ}}", "Europe/Berlin", 1)
+	err := testDb.QueryRowContext(ctx, qry).Scan(&ts)
+	if err != nil {
+		t.Log(errors.Wrap(err, qry))
+	}
+	t.Log(ts)
+	if !ts.IsZero() {
+		return
+	}
+
+	qry = "SELECT filename, version FROM v$timezone_file"
+	rows, err := testDb.QueryContext(ctx, qry)
+	if err != nil {
+		t.Log(qry, err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var fn, ver string
+		if err := rows.Scan(&fn, &ver); err != nil {
+			t.Log(qry, err)
+			continue
+		}
+		t.Log(fn, ver)
+	}
+	t.Skip("wanted non-zero time")
+}
+
+func TestGetDBTimeZone(t *testing.T) {
+	t.Parallel()
+	defer tl.enableLogging(t)()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	qry := "SELECT SESSIONTIMEZONE FROM DUAL"
+	var tz string
+	if err := testDb.QueryRowContext(ctx, qry).Scan(&tz); err != nil {
+		t.Fatal(errors.Wrap(err, qry))
+	}
+	t.Log("timezone:", tz)
+
+	for _, timS := range []string{"2006-07-08", "2006-01-02"} {
+		localTime, err := time.ParseInLocation("2006-01-02", timS, time.Local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		qry = "SELECT TO_DATE('" + timS + " 00:00:00', 'YYYY-MM-DD HH24:MI:SS') FROM DUAL"
+		var dbTime time.Time
+		t.Log("local:", localTime.Format(time.RFC3339))
+		if err := testDb.QueryRowContext(ctx, qry).Scan(&dbTime); err != nil {
+			t.Fatal(errors.Wrap(err, qry))
+		}
+		t.Log("db:", dbTime.Format(time.RFC3339))
+		if !dbTime.Equal(localTime) {
+			t.Errorf("db says %s, local is %s", dbTime.Format(time.RFC3339), localTime.Format(time.RFC3339))
+		}
+	}
+}
+
+func TestNumberBool(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	const qry = "SELECT 181 id, 1 status FROM DUAL"
+	rows, err := testDb.QueryContext(ctx, qry, goracle.NumberAsString())
+	if err != nil {
+		t.Fatal(errors.Wrap(err, qry))
+	}
+
+	for rows.Next() {
+		var id int
+		var status bool
+		if err := rows.Scan(&id, &status); err != nil {
+			t.Errorf("failed to scan data: %s\n", err)
+		}
+		t.Logf("Source id=%d, status=%t\n", id, status)
+	}
+}
+
+func TestCancel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip cancel test")
+	}
+	db, err := sql.Open("goracle", testConStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	pid := os.Getpid()
+	const maxConc = 10
+	db.SetMaxOpenConns(maxConc - 1)
+	db.SetMaxIdleConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), (2*maxConc+1)*time.Second)
+	defer cancel()
+	Cnt := func() int {
+		var cnt int
+		const qryCount = "SELECT COUNT(0) FROM v$session WHERE username = USER AND process = TO_CHAR(:1)"
+		if err := db.QueryRow(qryCount, pid).Scan(&cnt); err != nil {
+			t.Fatal(errors.Wrap(err, qryCount))
+		}
+		return cnt
+	}
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	t.Log("Pid:", pid)
+	goal := Cnt()
+	t.Logf("Before: %d", goal)
+	const qry = "BEGIN FOR rows IN (SELECT 1 FROM DUAL) LOOP DBMS_LOCK.SLEEP(10); END LOOP; END;"
+	subCtx, subCancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	for i := 0; i < maxConc; i++ {
+		wg.Add(1)
+		go func() {
+			//t.Log(qry)
+			//defer t.Log("END " + qry)
+			wg.Done()
+			if _, err := db.ExecContext(subCtx, qry); err != nil && errors.Cause(err) != context.Canceled {
+				t.Fatal(errors.Wrap(err, qry))
+			}
+		}()
+	}
+	wg.Wait()
+	t.Logf("After exec, before cancel: %d", Cnt())
+	subCancel()
+	time.Sleep(time.Second)
+	t.Logf("After cancel: %d", Cnt())
+
+	for i := 0; i < 2*maxConc; i++ {
+		cnt := Cnt()
+		t.Logf("After %ds: %d", i+1, cnt)
+		if i > maxConc && cnt <= goal {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Error("cancelation timed out")
 }
