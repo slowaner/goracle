@@ -52,7 +52,7 @@ type Querier interface {
 // This can help using unknown-at-compile-time, a.k.a.
 // dynamic queries.
 func DescribeQuery(ctx context.Context, db Execer, qry string) ([]QueryColumn, error) {
-	c, err := getConn(db)
+	c, err := getConn(ctx, db)
 	if err != nil {
 		return nil, err
 	}
@@ -253,8 +253,8 @@ func ReadDbmsOutput(ctx context.Context, w io.Writer, conn preparer) error {
 }
 
 // ClientVersion returns the VersionInfo from the DB.
-func ClientVersion(ex Execer) (VersionInfo, error) {
-	c, err := getConn(ex)
+func ClientVersion(ctx context.Context, ex Execer) (VersionInfo, error) {
+	c, err := getConn(ctx, ex)
 	if err != nil {
 		return VersionInfo{}, err
 	}
@@ -262,8 +262,8 @@ func ClientVersion(ex Execer) (VersionInfo, error) {
 }
 
 // ServerVersion returns the VersionInfo of the client.
-func ServerVersion(ex Execer) (VersionInfo, error) {
-	c, err := getConn(ex)
+func ServerVersion(ctx context.Context, ex Execer) (VersionInfo, error) {
+	c, err := getConn(ctx, ex)
 	if err != nil {
 		return VersionInfo{}, err
 	}
@@ -273,10 +273,11 @@ func ServerVersion(ex Execer) (VersionInfo, error) {
 // Conn is the interface for a connection, to be returned by DriverConn.
 type Conn interface {
 	driver.Conn
+	driver.ConnBeginTx
+	driver.ConnPrepareContext
 	driver.Pinger
+
 	Break() error
-	BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error)
-	PrepareContext(ctx context.Context, query string) (driver.Stmt, error)
 	Commit() error
 	Rollback() error
 	ServerVersion() (VersionInfo, error)
@@ -288,17 +289,17 @@ type Conn interface {
 }
 
 // DriverConn returns the *goracle.conn of the database/sql.Conn
-func DriverConn(ex Execer) (Conn, error) {
-	return getConn(ex)
+func DriverConn(ctx context.Context, ex Execer) (Conn, error) {
+	return getConn(ctx, ex)
 }
 
 var getConnMu sync.Mutex
 
-func getConn(ex Execer) (*conn, error) {
+func getConn(ctx context.Context, ex Execer) (*conn, error) {
 	getConnMu.Lock()
 	defer getConnMu.Unlock()
 	var c interface{}
-	if _, err := ex.ExecContext(context.Background(), getConnection, sql.Out{Dest: &c}); err != nil {
+	if _, err := ex.ExecContext(ctx, getConnection, sql.Out{Dest: &c}); err != nil {
 		return nil, errors.Wrap(err, "getConnection")
 	}
 	return c.(*conn), nil

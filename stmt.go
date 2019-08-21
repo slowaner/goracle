@@ -1030,7 +1030,7 @@ func (st *statement) bindVarTypeSwitch(info *argInfo, get *dataGetter, value int
 		}
 		info.set = dataSetBytes
 		if info.isOut {
-			info.bufSize = 4000
+			info.bufSize = 32767
 			*get = dataGetBytes
 		}
 
@@ -1086,8 +1086,10 @@ func (st *statement) bindVarTypeSwitch(info *argInfo, get *dataGetter, value int
 		}
 
 	case *Object:
-		info.objType = v.ObjectType.dpiObjectType
-		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_OBJECT, C.DPI_NATIVE_TYPE_OBJECT
+		if !nilPtr && v != nil {
+			info.objType = v.ObjectType.dpiObjectType
+			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_OBJECT, C.DPI_NATIVE_TYPE_OBJECT
+		}
 		info.set = st.dataSetObject
 		if info.isOut {
 			*get = st.dataGetObject
@@ -1527,18 +1529,27 @@ func dataGetBytes(v interface{}, data []C.dpiData) error {
 			*x = nil
 			return nil
 		}
-		b := C.dpiData_getBytes(&data[0])
+		db := C.dpiData_getBytes(&data[0])
+		b := ((*[32767]byte)(unsafe.Pointer(db.ptr)))[:db.length:db.length]
+		// b must be copied
+		*x = append((*x)[:0], b...)
 
-		*x = ((*[32767]byte)(unsafe.Pointer(b.ptr)))[:b.length:b.length]
 	case *[][]byte:
+		maX := (*x)[:cap(*x)]
 		*x = (*x)[:0]
 		for i := range data {
 			if data[i].isNull == 1 {
 				*x = append(*x, nil)
 				continue
 			}
-			b := C.dpiData_getBytes(&data[i])
-			*x = append(*x, ((*[32767]byte)(unsafe.Pointer(b.ptr)))[:b.length:b.length])
+			db := C.dpiData_getBytes(&data[i])
+			b := ((*[32767]byte)(unsafe.Pointer(db.ptr)))[:db.length:db.length]
+			// b must be copied
+			if i < len(maX) {
+				*x = append(*x, append(maX[i][:0], b...))
+			} else {
+				*x = append(*x, append(make([]byte, 0, len(b)), b...))
+			}
 		}
 
 	case *Number:

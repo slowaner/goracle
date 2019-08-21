@@ -82,11 +82,11 @@ func init() {
 	}
 
 	if testDb != nil {
-		if clientVersion, err = goracle.ClientVersion(testDb); err != nil {
+		if clientVersion, err = goracle.ClientVersion(context.Background(), testDb); err != nil {
 			fmt.Printf("ERROR: %+v\n", err)
 			return
 		}
-		if serverVersion, err = goracle.ServerVersion(testDb); err != nil {
+		if serverVersion, err = goracle.ServerVersion(context.Background(), testDb); err != nil {
 			fmt.Printf("ERROR: %+v\n", err)
 			return
 		}
@@ -821,8 +821,8 @@ func TestExecuteMany(t *testing.T) {
 			t.Errorf("%d. VC got %q, wanted %q.", i, vc, strs[i])
 		}
 		t.Logf("%d. dt=%v", i, dt)
-		if dt != dates[i] {
-			t.Errorf("%d. got DT %v, wanted %v.", i, dt, dates[i])
+		if !dt.Equal(dates[i]) {
+			t.Errorf("%d. got DT %v, wanted %v (%v)", i, dt, dates[i], dt.Sub(dates[i]))
 		}
 		i++
 	}
@@ -970,44 +970,6 @@ func copySlice(orig interface{}) interface{} {
 		rc.Index(i).Set(ro.Index(i))
 	}
 	return rc.Addr().Interface()
-}
-
-func TestObject(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	conn, err := testDb.Conn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	pkg := strings.ToUpper("test_pkg_obj" + tblSuffix)
-	qry := `CREATE OR REPLACE PACKAGE ` + pkg + ` IS
-  TYPE int_tab_typ IS TABLE OF PLS_INTEGER INDEX BY PLS_INTEGER;
-  TYPE rec_typ IS RECORD (int PLS_INTEGER, num NUMBER, vc VARCHAR2(1000), c CHAR(1000), dt DATE);
-  TYPE tab_typ IS TABLE OF rec_typ INDEX BY PLS_INTEGER;
-END;`
-	if _, err = conn.ExecContext(ctx, qry); err != nil {
-		t.Fatal(errors.Wrap(err, qry))
-	}
-	defer testDb.Exec("DROP PACKAGE " + pkg)
-
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback()
-
-	defer tl.enableLogging(t)()
-	ot, err := goracle.GetObjectType(tx, pkg+".int_tab_typ")
-	if err != nil {
-		if clientVersion.Version >= 12 && serverVersion.Version >= 12 {
-			t.Fatal(fmt.Sprintf("%+v", err))
-		}
-		t.Log(err)
-		t.Skip("client or server version < 12")
-	}
-	t.Log(ot)
 }
 
 func TestOpenClose(t *testing.T) {
@@ -1666,7 +1628,7 @@ func TestExecTimeout(t *testing.T) {
 	defer tl.enableLogging(t)()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if _, err := testDb.ExecContext(ctx, "SELECT COUNT(DISTINCT ORA_HASH(A.table_name)) from cat, cat, cat A"); err != nil {
+	if _, err := testDb.ExecContext(ctx, "DECLARE cnt PLS_INTEGER; BEGIN SELECT COUNT(0) INTO cnt FROM (SELECT 1 FROM all_objects WHERE ROWNUM < 1000), (SELECT 1 FROM all_objects WHERE rownum < 1000); END;"); err != nil {
 		t.Log(err)
 	}
 }
@@ -1676,7 +1638,7 @@ func TestQueryTimeout(t *testing.T) {
 	defer tl.enableLogging(t)()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if _, err := testDb.QueryContext(ctx, "SELECT COUNT(0) FROM all_objects, all_objects"); err != nil {
+	if _, err := testDb.QueryContext(ctx, "SELECT COUNT(0) FROM (SELECT 1 FROM all_objects WHERE rownum < 1000), (SELECT 1 FROM all_objects WHERE rownum < 1000)"); err != nil {
 		t.Log(err)
 	}
 }
@@ -1937,7 +1899,10 @@ func TestStartupShutdown(t *testing.T) {
 		t.Fatal(err, p.StringWithPassword())
 	}
 	defer db.Close()
-	conn, err := goracle.DriverConn(db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn, err := goracle.DriverConn(ctx, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2050,27 +2015,30 @@ func TestGetDBTimeZone(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	qry := "SELECT SESSIONTIMEZONE FROM DUAL"
-	var tz string
-	if err := testDb.QueryRowContext(ctx, qry).Scan(&tz); err != nil {
+	qry := "SELECT DBTIMEZONE, SESSIONTIMEZONE FROM DUAL"
+	var dbTz, tz string
+	if err := testDb.QueryRowContext(ctx, qry).Scan(&dbTz, &tz); err != nil {
 		t.Fatal(errors.Wrap(err, qry))
 	}
-	t.Log("timezone:", tz)
+	t.Log("db timezone:", dbTz, "session timezone:", tz)
 
-	for _, timS := range []string{"2006-07-08", "2006-01-02"} {
-		localTime, err := time.ParseInLocation("2006-01-02", timS, time.Local)
-		if err != nil {
-			t.Fatal(err)
-		}
-		qry = "SELECT TO_DATE('" + timS + " 00:00:00', 'YYYY-MM-DD HH24:MI:SS') FROM DUAL"
+	today := time.Now().Truncate(24 * time.Hour)
+	for i, tim := range []time.Time{today, today.AddDate(0, 6, 0)} {
+		t.Log("local:", tim.Format(time.RFC3339))
+
+		qry = "SELECT TO_DATE('" + tim.Format("2006-01-02") + " 00:00:00', 'YYYY-MM-DD HH24:MI:SS') FROM DUAL"
 		var dbTime time.Time
-		t.Log("local:", localTime.Format(time.RFC3339))
 		if err := testDb.QueryRowContext(ctx, qry).Scan(&dbTime); err != nil {
 			t.Fatal(errors.Wrap(err, qry))
 		}
 		t.Log("db:", dbTime.Format(time.RFC3339))
-		if !dbTime.Equal(localTime) {
-			t.Errorf("db says %s, local is %s", dbTime.Format(time.RFC3339), localTime.Format(time.RFC3339))
+		if !dbTime.Equal(tim) {
+			msg := fmt.Sprintf("db says %s, local is %s", dbTime.Format(time.RFC3339), tim.Format(time.RFC3339))
+			if i == 0 {
+				t.Error(msg)
+			} else {
+				t.Log(msg)
+			}
 		}
 	}
 }
@@ -2129,19 +2097,20 @@ func TestCancel(t *testing.T) {
 	t.Logf("Before: %d", goal)
 	const qry = "BEGIN FOR rows IN (SELECT 1 FROM DUAL) LOOP DBMS_LOCK.SLEEP(10); END LOOP; END;"
 	subCtx, subCancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
+	var grp errgroup.Group
 	for i := 0; i < maxConc; i++ {
-		wg.Add(1)
-		go func() {
+		grp.Go(func() error {
 			//t.Log(qry)
 			//defer t.Log("END " + qry)
-			wg.Done()
 			if _, err := db.ExecContext(subCtx, qry); err != nil && errors.Cause(err) != context.Canceled {
-				t.Fatal(errors.Wrap(err, qry))
+				return errors.Wrap(err, qry)
 			}
-		}()
+			return nil
+		})
 	}
-	wg.Wait()
+	if err = grp.Wait(); err != nil {
+		t.Fatal(err)
+	}
 	t.Logf("After exec, before cancel: %d", Cnt())
 	subCancel()
 	time.Sleep(time.Second)
@@ -2156,4 +2125,89 @@ func TestCancel(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 	t.Error("cancelation timed out")
+}
+
+func TestObject(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	testCon, err := goracle.DriverConn(ctx, testDb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cleanup := func() {
+		testDb.Exec("DROP PROCEDURE test_obj_modify")
+		testDb.Exec("DROP TYPE test_obj_tab_t")
+		testDb.Exec("DROP TYPE test_obj_rec_t")
+	}
+	cleanup()
+	const crea = `
+CREATE OR REPLACE TYPE test_obj_rec_t AS OBJECT (num NUMBER, vc VARCHAR2(1000), dt DATE);
+CREATE OR REPLACE TYPE test_obj_tab_t AS TABLE OF test_obj_rec_t;
+CREATE OR REPLACE PROCEDURE test_obj_modify(p_obj IN OUT NOCOPY test_obj_tab_t) IS
+BEGIN
+  p_obj.EXTEND;
+  p_obj(p_obj.LAST) := test_obj_rec_t(
+    num => 314/100 + p_obj.COUNT,
+    vc  => 'abraka dabra',
+    dt  => SYSDATE);
+END;`
+	for _, qry := range strings.Split(crea, "\nCREATE OR") {
+		if qry == "" {
+			continue
+		}
+		qry = "CREATE OR" + qry
+		if _, err = testDb.ExecContext(ctx, qry); err != nil {
+			t.Fatal(errors.Wrap(err, qry))
+		}
+	}
+
+	defer cleanup()
+
+	cOt, err := testCon.GetObjectType(strings.ToUpper("test_obj_tab_t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cOt.Close()
+	t.Log(cOt)
+
+	// create object from the type
+	coll, err := cOt.NewCollection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coll.Close()
+
+	// create an element object
+	elt, err := cOt.CollectionOf.NewObject()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer elt.Close()
+
+	// append to the collection
+	t.Logf("append an empty %s", elt)
+	coll.AppendObject(elt)
+
+	const mod = "BEGIN test_obj_modify(:1); END;"
+	if err = prepExec(ctx, testCon, mod, driver.NamedValue{Ordinal: 1, Value: coll}); err != nil {
+		t.Error(err)
+	}
+	t.Logf("coll: %s", coll)
+	var data goracle.Data
+	for i, err := coll.First(); err == nil; i, err = coll.Next(i) {
+		if err = coll.GetItem(&data, i); err != nil {
+			t.Fatal(err)
+		}
+		elt = data.GetObject()
+
+		t.Logf("elt[%d] : %s", i, elt)
+		for attr := range elt.Attributes {
+			val, err := elt.Get(attr)
+			if err != nil {
+				t.Error(err, attr)
+			}
+			t.Logf("elt[%d].%s=%s", i, attr, val)
+		}
+	}
 }

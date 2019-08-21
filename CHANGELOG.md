@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.20.0] - 2019-08-19
+### Added
+- Queue support with Objects.
+
+### Changed
+- Change Object Set/Get
+
+## [2.19.0] - 2019-08-15
+### Changed
+- Require Context for getConn and thus in ClientVersion, ServerVersion, GetObjectType, DriverConn functions.
+
+## [2.18.5] - 2019-08-14
+### Changed
+- Remove log.Println left in...
+
+## [2.18.4] - 2019-08-14
+### Changed
+- Timezone detection: DBTIMEZONE is plain wrong, parse from SYSTIMESTAMP.
+
+## [2.18.3] - 2019-08-13
+### Changed
+- GetObjectType uppercases the name by default.
+- Upgrade to ODPI-C v3.2.1
+
+## [2.18.2] - 2019-07-23
+### Changed
+- Force copying of bytes (garbage appears Out with RAW).
+
+## [2.18.0] - 2019-07-16
+### Added
+- Setable pool session timeouts.
+
 ## [2.16.4] - 2019-06-26
 ### Changed
 - Fix bool input (#166).
